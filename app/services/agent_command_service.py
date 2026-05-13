@@ -24,6 +24,17 @@ Your job is to choose the best tool for a user's Russian or English command.
 Never invent article codes. Extract only codes explicitly present in the user's message.
 If the request is unclear, out of scope, or missing the article codes needed for an action, do not call any tool.
 
+Deep search definition:
+- Deep search works with an attached file and the existing Google Sheet. The sheet has STAL articles
+  in the first column and their known analog articles in the other columns.
+- The attached file is read as rows/groups of new article codes. For each row/group, check every
+  article from that row/group against all codes already stored in the Google Sheet: both STAL articles
+  and existing analogs.
+- If any article from the new row/group is found in the sheet, take the STAL article from the matched
+  sheet row and add the whole new row/group from the attached file to that STAL article's analogs.
+- This finds a relation one level deeper than a direct STAL match: a new article row can be linked to
+  STAL through an already known analog article.
+
 Rules:
 - STAL article codes usually look like ST followed by digits, for example ST20868.
 - Aliases are non-STAL article codes related to the same physical product.
@@ -33,7 +44,8 @@ Rules:
 - Use delete_mapping only when the user explicitly asks to delete the whole STAL mapping, not just an alias.
 - Use ingest_file when a file is attached and the user asks to import, ingest, extract, parse, or process it.
 - Use deep_extraction_file when a file is attached and the user asks for deep search, deep extraction,
-  indirect matches, searching through the existing database, or finding analogs through another article.
+  indirect matches, matching new rows through existing analogs, searching through the existing
+  Google Sheet, or finding analogs through another article.
 - If a file is attached, put the user's extraction preferences into the ingest_file instructions argument.
 - If deep_extraction_file is selected, put the user's extraction preferences into its instructions argument.
 - Use search_by_stal when the user asks to find all articles for an explicitly provided STAL code, for example "Найди ST11013".
@@ -51,6 +63,19 @@ If the operation did not find anything or did not change anything, say that plai
 Do not mention internal tool names, JSON, schemas, or implementation details.
 """
 
+NO_TOOL_CONVERSATION_PROMPT = """\
+You are a helpful assistant for the STAL Analogs Manager (Telegram bot).
+The user's message was not turned into a backend action (no tool was selected).
+Reply in natural, friendly Russian (2–6 short sentences).
+- Greet back if they greet you; be warm but professional.
+- If they ask what you can do, summarize capabilities using ONLY the facts in the provided capabilities list.
+- If they ask what deep search means, explain it using ONLY the deep search description in the capabilities list.
+- Suggest 1–2 concrete next steps (examples: add aliases for ST..., search by code..., attach a file for extraction).
+- Do NOT claim you performed any database change, search result, or ingest — nothing was executed.
+- Do NOT invent STAL codes or article numbers; only use examples like ST12345 if illustrating phrasing.
+- Do NOT mention tools, APIs, JSON, or "function call".
+"""
+
 AGENT_CAPABILITIES = """\
 Я умею:
 - добавлять соответствия STAL-артикулов и аналогов;
@@ -62,7 +87,14 @@ AGENT_CAPABILITIES = """\
 - показывать сохраненную связку по STAL-коду;
 - массово добавлять связки из текста;
 - извлекать связки из приложенного файла;
-- выполнять глубокий поиск по приложенному файлу через уже сохраненную базу совпадений.
+- выполнять глубокий поиск по приложенному файлу через уже сохраненную Google-таблицу.
+
+Глубокий поиск:
+- В Google-таблице первый столбец содержит STAL-артикулы, а остальные столбцы содержат уже известные артикулы-аналоги.
+- Новый приложенный файл читается построчно: каждая строка рассматривается как набор новых артикулов, относящихся к одному товару.
+- Для каждой такой строки проверяется каждый артикул из нового файла: есть ли он уже в Google-таблице среди STAL-артикулов или среди аналогов.
+- Если совпадение найдено, берется STAL-артикул из найденной строки Google-таблицы, и вся строка артикулов из нового файла добавляется к этому STAL-артикулу как аналоги.
+- Поэтому поиск называется глубоким: связь находится не только по прямому STAL-артикулу, но и на один уровень глубже, через уже известный аналог.
 """
 
 TOOLS: list[dict[str, Any]] = [
@@ -200,8 +232,11 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "deep_extraction_file",
         "description": (
-            "Deep-search an attached file through existing mappings. Use this when the user asks to find "
-            "indirect STAL analog matches through any article already present in the database."
+            "Deep-search an attached file through the existing Google Sheet mappings. The file is read as "
+            "rows/groups of new article codes; if any code from a row/group already exists in the sheet "
+            "as a STAL article or known analog, the whole row/group is proposed as aliases for that "
+            "matched STAL article. Use this when the user asks to match new rows through existing analogs "
+            "or find indirect STAL analog matches one level deeper than a direct STAL-code match."
         ),
         "parameters": {
             "type": "object",
@@ -240,7 +275,11 @@ class AgentCommandService:
         tool_call = self._choose_tool(message, has_file=file_bytes is not None, filename=filename)
         if tool_call is None:
             return AgentCommandResponse(
-                message=self._unclear_request_message(),
+                message=self._natural_conversation_reply(
+                    message,
+                    has_file=file_bytes is not None,
+                    filename=filename,
+                ),
                 result={"status": "unclear_request"},
             )
 
@@ -296,6 +335,43 @@ class AgentCommandService:
             "Попробуйте сформулировать запрос еще раз: например, укажите STAL-артикул "
             "и аналоги, которые нужно добавить, удалить или найти."
         )
+
+    def _natural_conversation_reply(
+        self,
+        user_message: str,
+        has_file: bool,
+        filename: str | None,
+    ) -> str:
+        """LLM reply when no tool matches; falls back to template on failure."""
+        fallback = self._unclear_request_message()
+        context_lines = [
+            f"User message:\n{user_message or '(пусто)'}",
+            f"File attached: {'yes' if has_file else 'no'}",
+            f"Filename: {filename or ''}",
+            "",
+            "Facts you may rely on (capabilities):",
+            AGENT_CAPABILITIES.strip(),
+        ]
+        if has_file and not (user_message or "").strip():
+            context_lines.extend(
+                [
+                    "",
+                    "Note: user sent a file with almost no text. Explain they can write what to do with the file "
+                    "(extract / deep search) or use the menu buttons.",
+                ]
+            )
+        try:
+            response = self._client.responses.create(
+                model=self._model,
+                instructions=NO_TOOL_CONVERSATION_PROMPT,
+                input="\n".join(context_lines),
+            )
+        except Exception:
+            logger.exception("Failed to generate natural reply without tool call")
+            return fallback
+
+        text = (getattr(response, "output_text", "") or "").strip()
+        return text or fallback
 
     def _format_response_message(
         self,
