@@ -43,6 +43,9 @@ Rules:
 - Use set_aliases only when the user clearly wants to replace the full alias list.
 - Use delete_mapping only when the user explicitly asks to delete the whole STAL mapping, not just an alias.
 - Use ingest_file when a file is attached and the user asks to import, ingest, extract, parse, or process it.
+  ingest_file expects tables or structured lists of article codes (STAL codes ST+digits plus analogs).
+  If extraction yields no mappings, reply politely that the file may not contain suitable article tables
+  and suggest uploading a different file.
 - Use deep_extraction_file when a file is attached and the user asks for deep search, deep extraction,
   indirect matches, matching new rows through existing analogs, searching through the existing
   Google Sheet, or finding analogs through another article.
@@ -60,6 +63,9 @@ You write final replies for a Russian-speaking user of the STAL analogs storage 
 Write a short, natural Russian answer.
 Explain what was done and the result. Do not invent facts beyond the provided tool result.
 If the operation did not find anything or did not change anything, say that plainly.
+If the action was ingest_file and the tool result contains status "no_mappings_found", say in warm,
+clear Russian that the file probably does not contain suitable tables with article codes (including
+rows with STAL codes), and suggest uploading another file — match the tone of the fallback answer.
 Do not mention internal tool names, JSON, schemas, or implementation details.
 """
 
@@ -441,7 +447,12 @@ class AgentCommandService:
         if tool_name == "ingest_file":
             status = result.get("status")
             if status == "no_mappings_found":
-                return "В файле не удалось найти связки STAL-артикулов."
+                return (
+                    "Кажется, в файле нет подходящих таблиц с артикулами "
+                    "(или нет строк с кодами STAL).\n"
+                    "Загрузите, пожалуйста, другой файл — например, таблицу перекрёстных ссылок или прайс "
+                    "с колонками STAL и аналогов."
+                )
             return (
                 f"Файл обработан: извлечено {result.get('items_extracted', 0)}, "
                 "ожидает подтверждения перед сохранением."
