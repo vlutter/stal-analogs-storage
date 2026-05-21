@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     app_title: str = "STAL Analogs Storage"
     app_version: str = "0.1.0"
     debug: bool = False
+    api_token: str = ""
 
     google_sheets_spreadsheet_id: str = ""
     google_sheets_credentials_file: str = "credentials.json"

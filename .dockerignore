@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+!.env.example
+credentials.json
+logs
+dist
+build
+.mypy_cache
+.pytest_cache
+.idea

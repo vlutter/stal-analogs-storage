@@ -1,0 +1,115 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    name: Build and push Docker image
+    runs-on: ubuntu-24.04
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare image name
+        id: image
+        shell: bash
+        run: |
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=${IMAGE_NAME}:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Ubuntu server
+    runs-on: ubuntu-24.04
+    needs: docker
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          APP_IMAGE: ${{ needs.docker.outputs.image }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          envs: APP_IMAGE,DEPLOY_PATH,GHCR_TOKEN,GHCR_USER
+          script: |
+            set -eu
+
+            if [ -z "$DEPLOY_PATH" ]; then
+              echo "DEPLOY_PATH secret is required"
+              exit 1
+            fi
+
+            mkdir -p "$DEPLOY_PATH"
+            cd "$DEPLOY_PATH"
+
+            cat > docker-compose.yml <<'COMPOSE'
+            services:
+              api:
+                image: ${APP_IMAGE:-stal-analogs-storage:local}
+                container_name: stal-analogs-storage-api
+                restart: unless-stopped
+                env_file:
+                  - .env
+                environment:
+                  LOG_FILE: /app/logs/app.log
+                ports:
+                  - "${APP_HOST:-127.0.0.1}:${APP_PORT:-8000}:8000"
+                volumes:
+                  - app_logs:/app/logs
+                healthcheck:
+                  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+                  interval: 30s
+                  timeout: 5s
+                  start_period: 20s
+                  retries: 3
+
+            volumes:
+              app_logs:
+            COMPOSE
+
+            if [ ! -f .env ]; then
+              echo ".env is missing in $DEPLOY_PATH. Create it on the server before deployment."
+              exit 1
+            fi
+
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            APP_IMAGE="$APP_IMAGE" docker compose pull
+            APP_IMAGE="$APP_IMAGE" docker compose up -d --remove-orphans
+            docker image prune -f
