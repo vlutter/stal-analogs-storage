@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from app.api import agent, mappings, search
 from app.deps.auth import verify_api_token
 from app.repositories.sheets_repository import SheetsRepositoryError
+from app.services.file_storage_service import FileStorageError
 from app.utils.logging import setup_logging
 from app.utils.settings import settings
 
@@ -46,6 +47,14 @@ OPENAPI_TAGS = [
 async def lifespan(app: FastAPI):
     if not settings.api_token:
         raise RuntimeError("API_TOKEN is not configured. Set it in .env before starting the server.")
+
+    try:
+        agent.get_file_storage().ensure_bucket()
+    except FileStorageError as exc:
+        raise RuntimeError(
+            f"Cannot initialize S3 bucket '{settings.s3_bucket}' at '{settings.s3_endpoint_url}': {exc}"
+        ) from exc
+
     yield
 
 

@@ -7,6 +7,8 @@ from app.schemas.agent import AgentCommandResponse, IngestFileResponse, RefineIn
 from app.schemas.mapping import BulkUpsertRequest
 from app.services.agent_command_service import AgentCommandService
 from app.services.agent_service import AgentService
+from app.services.file_storage_service import FileStorageService
+from app.services.session_service import SessionService
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +18,14 @@ ALLOWED_EXTENSIONS = {".xlsx", ".xls", ".csv", ".pdf", ".png", ".jpg", ".jpeg", 
 ALLOWED_EXTENSIONS_TEXT = ", ".join(sorted(ALLOWED_EXTENSIONS))
 
 _service = AgentService()
-_command_service = AgentCommandService()
+_file_storage = FileStorageService()
+_session_service = SessionService(file_storage=_file_storage)
+_command_service = AgentCommandService(sessions=_session_service)
+
+
+def get_file_storage() -> FileStorageService:
+    """Access the shared FileStorageService instance (used during app startup)."""
+    return _file_storage
 
 
 @router.post(
@@ -169,6 +178,11 @@ async def refine_ingest_items(body: RefineIngestItemsRequest):
     },
 )
 async def run_command(
+    user_id: str = Form(
+        ...,
+        description="Идентификатор пользователя (telegram user_id) для привязки контекста диалога.",
+        examples=["123456789"],
+    ),
     message: str = Form(
         default="",
         description="Текст команды пользователя на русском или английском языке.",
@@ -181,6 +195,7 @@ async def run_command(
 ):
     filename = file.filename if file else None
     file_bytes: bytes | None = None
+    content_type: str | None = None
 
     if file is not None:
         filename = file.filename or "unknown"
@@ -195,12 +210,47 @@ async def run_command(
         file_bytes = await file.read()
         if not file_bytes:
             raise HTTPException(400, detail="Uploaded file is empty")
+        content_type = file.content_type
 
     try:
-        return _command_service.run(message=message, file_bytes=file_bytes, filename=filename)
+        return _command_service.run(
+            message=message,
+            user_id=user_id,
+            file_bytes=file_bytes,
+            filename=filename,
+            content_type=content_type,
+        )
     except ValueError as e:
         logger.warning("Validation error while running agent command: %s", e)
         raise HTTPException(400, detail=str(e))
     except Exception:
         logger.exception("Failed to run agent command")
         raise HTTPException(500, detail="Internal error while running agent command")
+
+
+@router.post(
+    "/session/reset",
+    summary="Сбросить контекст диалога",
+    description=(
+        "Закрывает активную сессию пользователя и начинает новую. "
+        "Используется ботом для команды `/new`.\n\n"
+        f"{AUTH_DESCRIPTION}"
+    ),
+    responses={
+        200: {"description": "Сессия успешно сброшена."},
+        **COMMON_RESPONSES,
+    },
+)
+async def reset_session(
+    user_id: str = Form(
+        ...,
+        description="Идентификатор пользователя (telegram user_id) для сброса контекста.",
+        examples=["123456789"],
+    ),
+):
+    try:
+        session = _session_service.reset(user_id)
+        return {"status": "ok", "session_id": session.id}
+    except Exception:
+        logger.exception("Failed to reset agent session for user_id=%s", user_id)
+        raise HTTPException(500, detail="Internal error while resetting session")

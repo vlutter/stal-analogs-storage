@@ -7,7 +7,9 @@
 3. Workflow подключается к серверу по SSH.
 4. На сервере запускается `docker compose pull && docker compose up -d`.
 
-Секреты приложения (`API_TOKEN`, `OPENAI_API_KEY`, Google credentials) хранятся только на сервере в `.env`.
+Секреты приложения (`API_TOKEN`, `OPENAI_API_KEY`, Google credentials, доступы к MinIO) хранятся только на сервере в `.env`.
+
+Помимо самого API, docker-compose поднимает сервис `minio` (S3-совместимое хранилище для файлов, которые пользователь прикрепляет к агенту) и держит SQLite-БД сессий агента на отдельном томе.
 
 ## 1. Подготовить сервер
 
@@ -77,6 +79,28 @@ GOOGLE_SHEETS_SHEET_NAME=Лист1
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4o
 LOG_LEVEL=INFO
+
+# Сессии агента (контекст диалога)
+SESSIONS_DB_PATH=/app/data/sessions.db
+AGENT_HISTORY_LIMIT=10
+AGENT_SESSION_TTL_MINUTES=30
+
+# S3-совместимое хранилище (MinIO в docker-compose)
+S3_ENDPOINT_URL=http://minio:9000
+S3_ACCESS_KEY=replace-with-strong-access-key
+S3_SECRET_KEY=replace-with-strong-secret-key
+S3_BUCKET=agent-files
+S3_REGION=us-east-1
+S3_USE_SSL=false
+
+# Логин/пароль для MinIO (должны совпадать с S3_ACCESS_KEY/S3_SECRET_KEY)
+MINIO_ROOT_USER=replace-with-strong-access-key
+MINIO_ROOT_PASSWORD=replace-with-strong-secret-key
+
+# Публикация MinIO (по умолчанию только на 127.0.0.1)
+MINIO_HOST=127.0.0.1
+MINIO_PORT=9000
+MINIO_CONSOLE_PORT=9001
 ```
 
 Для Docker удобнее использовать `GOOGLE_SHEETS_CREDENTIALS_JSON`, а не файл `credentials.json`. JSON должен быть в одну строку. На локальной машине его можно получить так:
@@ -84,6 +108,12 @@ LOG_LEVEL=INFO
 ```bash
 python -c "import json; print(json.dumps(json.load(open('credentials.json', encoding='utf-8')), separators=(',', ':')))"
 ```
+
+Важно про MinIO и S3:
+
+- `S3_ACCESS_KEY` / `S3_SECRET_KEY` должны совпадать с `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` — это один и тот же пользователь, под которым API ходит в бакет.
+- Бакет с именем `S3_BUCKET` создаётся автоматически при старте API (`ensure_bucket` в `lifespan`). Если MinIO недоступен, API не стартует.
+- Файлы пользователя и БД сессий лежат на именованных томах `minio_data` и `app_data` — они переживают `docker compose down` (но не `down -v`).
 
 ## 3. Настроить GitHub Secrets
 
@@ -113,6 +143,7 @@ GitHub -> Actions -> CI/CD -> Run workflow
 cd /home/deploy/stal-analogs-storage
 docker compose ps
 docker compose logs -f api
+docker compose logs -f minio
 curl http://127.0.0.1:8000/health
 ```
 
@@ -120,6 +151,19 @@ curl http://127.0.0.1:8000/health
 
 ```json
 { "status": "ok", "version": "0.1.0" }
+```
+
+Проверьте, что MinIO здоров и бакет создан:
+
+```bash
+docker compose exec minio mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+docker compose exec minio mc ls local
+```
+
+Веб-консоль MinIO доступна на `http://127.0.0.1:9001` (логин/пароль из `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`). Если хотите достучаться до неё с локальной машины через SSH-туннель:
+
+```bash
+ssh -L 9001:127.0.0.1:9001 deploy@YOUR_SERVER_IP
 ```
 
 ## 5. Опубликовать наружу
@@ -158,12 +202,35 @@ ufw allow 8000/tcp
 ufw enable
 ```
 
+Если хотите открыть MinIO наружу (например, для прямого аплоада из других сервисов), либо публикуйте через nginx с TLS на отдельном поддомене, либо в `.env` поменяйте `MINIO_HOST=0.0.0.0` и откройте порты `9000/9001` в фаерволе. Делайте это только с надёжными `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`.
+
 ## Полезные команды
 
 ```bash
 docker compose ps
 docker compose logs -f api
+docker compose logs -f minio
 docker compose restart api
 docker compose pull && docker compose up -d
 docker image prune -f
+```
+
+Бэкап важных данных:
+
+```bash
+# SQLite с сессиями и историей
+docker run --rm -v stal-analogs-storage_app_data:/data -v "$PWD":/backup alpine \
+    tar czf /backup/sessions-$(date +%F).tgz -C /data .
+
+# Файлы агента из MinIO
+docker run --rm -v stal-analogs-storage_minio_data:/data -v "$PWD":/backup alpine \
+    tar czf /backup/minio-$(date +%F).tgz -C /data .
+```
+
+Если нужно полностью очистить контекст сессий и загруженные файлы, остановите стек и удалите тома:
+
+```bash
+docker compose down
+docker volume rm stal-analogs-storage_app_data stal-analogs-storage_minio_data
+docker compose up -d
 ```

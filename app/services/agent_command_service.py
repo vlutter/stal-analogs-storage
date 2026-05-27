@@ -8,11 +8,13 @@ from typing import Any
 
 from openai import OpenAI
 
+from app.repositories.sessions_repository import Session
 from app.schemas.agent import AgentCommandResponse
 from app.schemas.mapping import BulkUpsertItem, BulkUpsertRequest, MappingUpdate
 from app.services.agent_service import AgentService
 from app.services.mapping_service import MappingService
 from app.services.search_service import SearchService
+from app.services.session_service import SessionService
 from app.utils.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -265,27 +267,66 @@ class AgentCommandService:
         agent: AgentService | None = None,
         mapping: MappingService | None = None,
         search: SearchService | None = None,
+        sessions: SessionService | None = None,
     ) -> None:
         self._client = OpenAI(api_key=settings.openai_api_key)
         self._model = settings.openai_model
         self._agent = agent or AgentService()
         self._mapping = mapping or MappingService()
         self._search = search or SearchService()
+        self._sessions = sessions or SessionService()
+
+    @property
+    def sessions(self) -> SessionService:
+        return self._sessions
 
     def run(
         self,
         message: str,
+        user_id: str,
         file_bytes: bytes | None = None,
         filename: str | None = None,
+        content_type: str | None = None,
     ) -> AgentCommandResponse:
-        tool_call = self._choose_tool(message, has_file=file_bytes is not None, filename=filename)
+        session = self._sessions.get_or_create(user_id)
+
+        if file_bytes is not None and filename:
+            try:
+                self._sessions.save_attached_file(session, filename, file_bytes, content_type)
+            except Exception:
+                logger.exception(
+                    "Failed to persist attached file '%s' in session %d", filename, session.id,
+                )
+
+        history = self._sessions.build_history_for_llm(session)
+
+        active_file_meta = self._sessions.get_last_attached_file_meta(session)
+        session_active_filename = (
+            active_file_meta.filename if (active_file_meta and file_bytes is None) else None
+        )
+
+        self._sessions.record_user_message(
+            session, message, attached_filename=filename if file_bytes else None,
+        )
+
+        tool_call = self._choose_tool(
+            message,
+            has_file=file_bytes is not None,
+            filename=filename,
+            session_active_filename=session_active_filename,
+            history=history,
+        )
         if tool_call is None:
+            reply = self._natural_conversation_reply(
+                message,
+                has_file=file_bytes is not None,
+                filename=filename,
+                session_active_filename=session_active_filename,
+                history=history,
+            )
+            self._sessions.record_assistant_message(session, reply)
             return AgentCommandResponse(
-                message=self._natural_conversation_reply(
-                    message,
-                    has_file=file_bytes is not None,
-                    filename=filename,
-                ),
+                message=reply,
                 result={"status": "unclear_request"},
             )
 
@@ -293,25 +334,57 @@ class AgentCommandService:
         tool_arguments = self._parse_tool_arguments(getattr(tool_call, "arguments", "{}"))
         logger.info("Agent selected tool '%s' with arguments: %s", tool_name, tool_arguments)
 
-        result = self._execute_tool(tool_name, tool_arguments, file_bytes=file_bytes, filename=filename)
+        result = self._execute_tool(
+            tool_name,
+            tool_arguments,
+            file_bytes=file_bytes,
+            filename=filename,
+            session=session,
+        )
+        reply = self._format_response_message(
+            message, tool_name, tool_arguments, result, history=history,
+        )
+        self._sessions.record_assistant_message(
+            session,
+            reply,
+            tool_name=tool_name,
+            tool_arguments=tool_arguments,
+            tool_result=result,
+        )
         return AgentCommandResponse(
-            message=self._format_response_message(message, tool_name, tool_arguments, result),
+            message=reply,
             tool_name=tool_name,
             tool_arguments=tool_arguments,
             result=result,
         )
 
-    def _choose_tool(self, message: str, has_file: bool, filename: str | None):
-        context = (
-            f"User command: {message}\n"
-            f"Attached file: {'yes' if has_file else 'no'}\n"
-            f"Filename: {filename or ''}"
-        )
+    def _choose_tool(
+        self,
+        message: str,
+        has_file: bool,
+        filename: str | None,
+        session_active_filename: str | None = None,
+        history: list[dict[str, str]] | None = None,
+    ):
+        context_lines = [
+            f"User command: {message}",
+            f"Attached file: {'yes' if has_file else 'no'}",
+            f"Filename: {filename or ''}",
+        ]
+        if session_active_filename:
+            context_lines.append(
+                f"Previously attached file in this session: {session_active_filename} "
+                f"(use it for ingest_file or deep_extraction_file if the user refers to it)."
+            )
+        context = "\n".join(context_lines)
+
+        llm_input: list[dict[str, str]] = list(history or [])
+        llm_input.append({"role": "user", "content": context})
 
         response = self._client.responses.create(
             model=self._model,
             instructions=SYSTEM_PROMPT,
-            input=context,
+            input=llm_input,
             tools=TOOLS,
             tool_choice="auto",
         )
@@ -347,6 +420,8 @@ class AgentCommandService:
         user_message: str,
         has_file: bool,
         filename: str | None,
+        session_active_filename: str | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> str:
         """LLM reply when no tool matches; falls back to template on failure."""
         fallback = self._unclear_request_message()
@@ -354,10 +429,16 @@ class AgentCommandService:
             f"User message:\n{user_message or '(пусто)'}",
             f"File attached: {'yes' if has_file else 'no'}",
             f"Filename: {filename or ''}",
+        ]
+        if session_active_filename:
+            context_lines.append(
+                f"Previously attached file in this session: {session_active_filename}"
+            )
+        context_lines.extend([
             "",
             "Facts you may rely on (capabilities):",
             AGENT_CAPABILITIES.strip(),
-        ]
+        ])
         if has_file and not (user_message or "").strip():
             context_lines.extend(
                 [
@@ -366,11 +447,15 @@ class AgentCommandService:
                     "(extract / deep search) or use the menu buttons.",
                 ]
             )
+
+        llm_input: list[dict[str, str]] = list(history or [])
+        llm_input.append({"role": "user", "content": "\n".join(context_lines)})
+
         try:
             response = self._client.responses.create(
                 model=self._model,
                 instructions=NO_TOOL_CONVERSATION_PROMPT,
-                input="\n".join(context_lines),
+                input=llm_input,
             )
         except Exception:
             logger.exception("Failed to generate natural reply without tool call")
@@ -385,9 +470,10 @@ class AgentCommandService:
         tool_name: str,
         tool_arguments: dict[str, Any],
         result: dict[str, Any],
+        history: list[dict[str, str]] | None = None,
     ) -> str:
         fallback = self._response_message(tool_name, result)
-        formatter_input = (
+        formatter_input_text = (
             f"User request:\n{user_message}\n\n"
             f"Selected action:\n{tool_name}\n\n"
             f"Action arguments:\n{json.dumps(tool_arguments, ensure_ascii=False)}\n\n"
@@ -395,11 +481,14 @@ class AgentCommandService:
             f"Fallback answer:\n{fallback}"
         )
 
+        llm_input: list[dict[str, str]] = list(history or [])
+        llm_input.append({"role": "user", "content": formatter_input_text})
+
         try:
             response = self._client.responses.create(
                 model=self._model,
                 instructions=RESPONSE_PROMPT,
-                input=formatter_input,
+                input=llm_input,
             )
         except Exception:
             logger.exception("Failed to format agent command response with LLM")
@@ -475,6 +564,7 @@ class AgentCommandService:
         args: dict[str, Any],
         file_bytes: bytes | None,
         filename: str | None,
+        session: Session | None = None,
     ) -> dict[str, Any]:
         if tool_name == "add_aliases":
             result = self._mapping.add_aliases(args["stal_code"], args["aliases"], source_filename="agent-command")
@@ -525,23 +615,48 @@ class AgentCommandService:
             return result.model_dump()
 
         if tool_name == "ingest_file":
-            if not file_bytes or not filename:
+            effective_filename, effective_bytes = self._resolve_file_for_tool(
+                file_bytes, filename, session
+            )
+            if not effective_bytes or not effective_filename:
                 raise ValueError("ingest_file requires an attached file")
             result = self._agent.ingest_file(
-                filename,
-                file_bytes,
+                effective_filename,
+                effective_bytes,
                 instructions=args.get("instructions") or None,
             )
             return result.model_dump()
 
         if tool_name == "deep_extraction_file":
-            if not file_bytes or not filename:
+            effective_filename, effective_bytes = self._resolve_file_for_tool(
+                file_bytes, filename, session
+            )
+            if not effective_bytes or not effective_filename:
                 raise ValueError("deep_extraction_file requires an attached file")
             result = self._agent.deep_extraction_file(
-                filename,
-                file_bytes,
+                effective_filename,
+                effective_bytes,
                 instructions=args.get("instructions") or None,
             )
             return result.model_dump()
 
         raise ValueError(f"Unsupported agent tool: {tool_name}")
+
+    def _resolve_file_for_tool(
+        self,
+        file_bytes: bytes | None,
+        filename: str | None,
+        session: Session | None,
+    ) -> tuple[str | None, bytes | None]:
+        """Use the freshly attached file, otherwise fall back to the session's last file."""
+        if file_bytes and filename:
+            return filename, file_bytes
+        if session is None:
+            return None, None
+        active = self._sessions.get_active_file(session)
+        if active is None:
+            return None, None
+        logger.info(
+            "Reusing previously attached file '%s' from session %d", active.filename, session.id,
+        )
+        return active.filename, active.content

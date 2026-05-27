@@ -7,10 +7,16 @@ services:
       - .env
     environment:
       LOG_FILE: /app/logs/app.log
+      SESSIONS_DB_PATH: /app/data/sessions.db
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
     ports:
       - "${APP_HOST:-127.0.0.1}:${APP_PORT:-8000}:8000"
     volumes:
       - app_logs:/app/logs
+      - app_data:/app/data
+    depends_on:
+      minio:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
       interval: 30s
@@ -18,5 +24,27 @@ services:
       start_period: 20s
       retries: 3
 
+  minio:
+    image: minio/minio:latest
+    container_name: stal-analogs-storage-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_HOST:-127.0.0.1}:${MINIO_PORT:-9000}:9000"
+      - "${MINIO_HOST:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
 volumes:
   app_logs:
+  app_data:
+  minio_data:

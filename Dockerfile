@@ -16,7 +16,7 @@ RUN pip install --upgrade pip \
 
 COPY app ./app
 
-RUN mkdir -p /app/logs \
+RUN mkdir -p /app/logs /app/data \
     && chown -R appuser:appuser /app
 
 USER appuser
