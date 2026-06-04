@@ -55,6 +55,19 @@ jobs:
     runs-on: ubuntu-24.04
     needs: docker
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy docker-compose.yml
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: docker-compose.yml
+          target: ${{ secrets.DEPLOY_PATH }}
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.2.2
         env:
@@ -79,30 +92,10 @@ jobs:
             mkdir -p "$DEPLOY_PATH"
             cd "$DEPLOY_PATH"
 
-            cat > docker-compose.yml <<'COMPOSE'
-            services:
-              api:
-                image: ${APP_IMAGE:-stal-analogs-storage:local}
-                container_name: stal-analogs-storage-api
-                restart: unless-stopped
-                env_file:
-                  - .env
-                environment:
-                  LOG_FILE: /app/logs/app.log
-                ports:
-                  - "${APP_HOST:-127.0.0.1}:${APP_PORT:-8000}:8000"
-                volumes:
-                  - app_logs:/app/logs
-                healthcheck:
-                  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
-                  interval: 30s
-                  timeout: 5s
-                  start_period: 20s
-                  retries: 3
-
-            volumes:
-              app_logs:
-            COMPOSE
+            if [ ! -f docker-compose.yml ]; then
+              echo "docker-compose.yml is missing in $DEPLOY_PATH"
+              exit 1
+            fi
 
             if [ ! -f .env ]; then
               echo ".env is missing in $DEPLOY_PATH. Create it on the server before deployment."
