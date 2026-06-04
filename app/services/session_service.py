@@ -27,6 +27,12 @@ class AttachedFileBytes:
     s3_key: str
 
 
+@dataclass
+class ActiveIngestPreview:
+    filename: str
+    items: list[dict[str, Any]]
+
+
 class SessionService:
     def __init__(
         self,
@@ -45,12 +51,17 @@ class SessionService:
         return self._files
 
     def get_or_create(self, user_id: str) -> Session:
-        session = self._repo.get_active_session(user_id, self._ttl)
+        session, expired_session_id = self._repo.get_active_session(user_id, self._ttl)
+        if expired_session_id is not None:
+            self._cleanup_session_files(expired_session_id)
         if session is not None:
             return session
         return self._repo.create_session(user_id)
 
     def reset(self, user_id: str) -> Session:
+        active_session_ids = self._repo.get_active_session_ids(user_id)
+        for session_id in active_session_ids:
+            self._cleanup_session_files(session_id)
         closed = self._repo.close_active_sessions(user_id)
         logger.info("Reset agent session for user=%s (closed=%d)", user_id, closed)
         return self._repo.create_session(user_id)
@@ -91,6 +102,7 @@ class SessionService:
     ) -> AttachedFile:
         if self._files is None:
             raise FileStorageError("File storage is not configured")
+        self._cleanup_session_files(session.id)
         s3_key, ctype = self._files.upload(filename, file_bytes, content_type=content_type)
         return self._repo.add_attached_file(
             session_id=session.id,
@@ -120,6 +132,35 @@ class SessionService:
             logger.exception("Failed to download active file for session %d", session.id)
             return None
         return AttachedFileBytes(filename=meta.filename, content=content, s3_key=meta.s3_key)
+
+    def get_active_ingest_preview(self, session: Session) -> ActiveIngestPreview | None:
+        """Return the latest unapplied ingest preview from the agent history."""
+        messages = self._repo.get_last_messages(session.id, max(self._history_limit, 100))
+        for msg in reversed(messages):
+            tool = msg.tool_name or ""
+            if tool in {"apply_ingest_preview", "cancel_ingest_preview"}:
+                return None
+            if tool not in {"ingest_file", "deep_extraction_file", "refine_ingest_items"}:
+                continue
+
+            try:
+                result = json.loads(msg.tool_result) if msg.tool_result else {}
+            except json.JSONDecodeError:
+                logger.warning("Invalid ingest preview JSON in message %d", msg.id)
+                return None
+
+            if tool == "deep_extraction_file":
+                filename = result.get("source_filename") or result.get("filename")
+                items = result.get("items") or []
+            else:
+                filename = result.get("filename")
+                items = result.get("llm_items") or []
+
+            if filename and items:
+                return ActiveIngestPreview(filename=filename, items=items)
+            return None
+
+        return None
 
     def build_history_for_llm(self, session: Session) -> list[dict[str, str]]:
         """Build a list of {role, content} entries for OpenAI responses.create(input=...)."""
@@ -161,4 +202,29 @@ class SessionService:
             return "ingest_file (использован файл из сессии)"
         if tool == "deep_extraction_file":
             return "deep_extraction_file (использован файл из сессии)"
+        if tool == "refine_ingest_items":
+            return "refine_ingest_items (обновлен предпросмотр загрузки)"
+        if tool == "apply_ingest_preview":
+            return "apply_ingest_preview (предпросмотр сохранен)"
+        if tool == "cancel_ingest_preview":
+            return "cancel_ingest_preview (предпросмотр отменен)"
         return tool
+
+    def _cleanup_session_files(self, session_id: int) -> None:
+        files = self._repo.list_attached_files(session_id)
+        if not files:
+            return
+
+        if self._files is not None:
+            for meta in files:
+                try:
+                    self._files.delete(meta.s3_key)
+                except FileStorageError:
+                    logger.exception(
+                        "Failed to delete S3 object key=%s for session %d",
+                        meta.s3_key,
+                        session_id,
+                    )
+
+        deleted = self._repo.delete_attached_files_for_session(session_id)
+        logger.info("Cleaned up %d attached file(s) for session %d", deleted, session_id)

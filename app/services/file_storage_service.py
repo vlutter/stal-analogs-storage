@@ -107,3 +107,16 @@ class FileStorageService:
         except ClientError as exc:
             logger.exception("Failed to download key=%s from S3", s3_key)
             raise FileStorageError(f"Cannot download file '{s3_key}' from S3") from exc
+
+    def delete(self, s3_key: str) -> None:
+        """Delete an object from S3. Missing keys are ignored."""
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=s3_key)
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code", "")
+            if error_code in {"NoSuchKey", "404", "NotFound"}:
+                logger.warning("S3 object key=%s already missing, skipping delete", s3_key)
+                return
+            logger.exception("Failed to delete key=%s from S3", s3_key)
+            raise FileStorageError(f"Cannot delete file '{s3_key}' from S3") from exc
+        logger.info("Deleted S3 object key=%s", s3_key)

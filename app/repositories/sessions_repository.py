@@ -151,8 +151,12 @@ class SessionsRepository:
             created_at=_parse_dt(row["created_at"]),
         )
 
-    def get_active_session(self, user_id: str, ttl: timedelta) -> Session | None:
-        """Return active session if it exists and is not expired."""
+    def get_active_session(self, user_id: str, ttl: timedelta) -> tuple[Session | None, int | None]:
+        """Return active session if it exists and is not expired.
+
+        When the session is expired it is closed and its id is returned as the second
+        value so the caller can clean up attached files.
+        """
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 """
@@ -166,7 +170,7 @@ class SessionsRepository:
             ).fetchone()
 
             if row is None:
-                return None
+                return None, None
 
             session = self._row_to_session(row)
             now = datetime.now(timezone.utc)
@@ -179,8 +183,8 @@ class SessionsRepository:
                     "Session %d for user=%s expired (TTL %s) and was closed",
                     session.id, user_id, ttl,
                 )
-                return None
-            return session
+                return None, session.id
+            return session, None
 
     def create_session(self, user_id: str) -> Session:
         now_iso = _utcnow_iso()
@@ -199,6 +203,14 @@ class SessionsRepository:
             ).fetchone()
         logger.info("Created session %d for user=%s", session_id, user_id)
         return self._row_to_session(row)
+
+    def get_active_session_ids(self, user_id: str) -> list[int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM sessions WHERE user_id = ? AND status = 'active'",
+                (user_id,),
+            ).fetchall()
+        return [row["id"] for row in rows]
 
     def close_active_sessions(self, user_id: str) -> int:
         with self._lock, self._connect() as conn:
@@ -305,3 +317,24 @@ class SessionsRepository:
                 (session_id,),
             ).fetchone()
         return self._row_to_attached_file(row) if row else None
+
+    def list_attached_files(self, session_id: int) -> list[AttachedFile]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, session_id, filename, s3_key, content_type, size_bytes, created_at
+                FROM attached_files
+                WHERE session_id = ?
+                ORDER BY id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [self._row_to_attached_file(row) for row in rows]
+
+    def delete_attached_files_for_session(self, session_id: int) -> int:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM attached_files WHERE session_id = ?",
+                (session_id,),
+            )
+            return cur.rowcount or 0

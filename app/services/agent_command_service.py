@@ -9,7 +9,7 @@ from typing import Any
 from openai import OpenAI
 
 from app.repositories.sessions_repository import Session
-from app.schemas.agent import AgentCommandResponse
+from app.schemas.agent import AgentCommandResponse, RefineIngestItemsRequest
 from app.schemas.mapping import BulkUpsertItem, BulkUpsertRequest, MappingUpdate
 from app.services.agent_service import AgentService
 from app.services.mapping_service import MappingService
@@ -53,6 +53,14 @@ Rules:
   Google Sheet, or finding analogs through another article.
 - If a file is attached, put the user's extraction preferences into the ingest_file instructions argument.
 - If deep_extraction_file is selected, put the user's extraction preferences into its instructions argument.
+- After ingest_file or deep_extraction_file returns a preview, treat the next user messages as part
+  of that preview flow while an active preview exists.
+- Use refine_ingest_items when the user asks to correct, filter, remove duplicates from, or otherwise
+  change the active ingest preview. Pass only the user's correction text.
+- Use apply_ingest_preview when the user confirms the active preview with words/buttons like
+  "Применить", "сохранить", "да", "ok".
+- Use cancel_ingest_preview when the user rejects the active preview with words/buttons like
+  "Отменить", "отмена", "нет", "cancel".
 - Use search_by_stal when the user asks to find all articles for an explicitly provided STAL code, for example "Найди ST11013".
 - Use search_article when the user asks to find the STAL article by a non-STAL alias code, for example "Найди AT112393".
 - Use get_mapping when the user explicitly asks to show the stored mapping or aliases for a known STAL code.
@@ -68,7 +76,10 @@ If the operation did not find anything or did not change anything, say that plai
 If the action was ingest_file and the tool result contains status "no_mappings_found", say in warm,
 clear Russian that the file probably does not contain suitable tables with article codes (including
 rows with STAL codes), and suggest uploading another file — match the tone of the fallback answer.
+If the action was refine_ingest_items, explain that the preview was updated and still needs confirmation.
+If the action was apply_ingest_preview or cancel_ingest_preview, explain the final outcome plainly.
 Do not mention internal tool names, JSON, schemas, or implementation details.
+For emphasis use **bold** around article codes or key values.
 """
 
 NO_TOOL_CONVERSATION_PROMPT = """\
@@ -79,12 +90,15 @@ Reply in natural, friendly Russian (2–6 short sentences).
 - If they ask what you can do, summarize capabilities using ONLY the facts in the provided capabilities list.
 - If they ask what deep search means, explain it using ONLY the deep search description in the capabilities list.
 - Suggest 1–2 concrete next steps (examples: add aliases for ST..., search by code..., attach a file for extraction).
+- Mention preview edit/apply/cancel ONLY when the user context includes an active ingest preview.
+  Never suggest editing preview for a newly attached file before extraction has been run.
 - Do NOT claim you performed any database change, search result, or ingest — nothing was executed.
 - Do NOT invent STAL codes or article numbers; only use examples like ST12345 if illustrating phrasing.
 - Do NOT mention tools, APIs, JSON, or "function call".
+- For emphasis use **bold** around article codes or key values.
 """
 
-AGENT_CAPABILITIES = """\
+AGENT_CAPABILITIES_BASE = """\
 Я умею:
 - добавлять соответствия STAL-артикулов и аналогов;
 - полностью заменять список аналогов для STAL-артикула;
@@ -96,7 +110,13 @@ AGENT_CAPABILITIES = """\
 - массово добавлять связки из текста;
 - извлекать связки из приложенного файла;
 - выполнять глубокий поиск по приложенному файлу через уже сохраненную Google-таблицу.
+"""
 
+AGENT_PREVIEW_CAPABILITIES = """\
+- править, применять или отменять предпросмотр извлеченных из файла данных.
+"""
+
+AGENT_DEEP_SEARCH_DESCRIPTION = """\
 Глубокий поиск:
 - В Google-таблице первый столбец содержит STAL-артикулы, а остальные столбцы содержат уже известные артикулы-аналоги.
 - Новый приложенный файл читается построчно: каждая строка рассматривается как набор новых артикулов, относящихся к одному товару.
@@ -104,6 +124,16 @@ AGENT_CAPABILITIES = """\
 - Если совпадение найдено, берется STAL-артикул из найденной строки Google-таблицы, и вся строка артикулов из нового файла добавляется к этому STAL-артикулу как аналоги.
 - Поэтому поиск называется глубоким: связь находится не только по прямому STAL-артикулу, но и на один уровень глубже, через уже известный аналог.
 """
+
+
+def build_agent_capabilities(*, include_preview: bool = False) -> str:
+    """Собирает список возможностей; правка предпросмотра — только после извлечения."""
+    parts = [AGENT_CAPABILITIES_BASE.strip()]
+    if include_preview:
+        parts.append(AGENT_PREVIEW_CAPABILITIES.strip())
+    parts.append(AGENT_DEEP_SEARCH_DESCRIPTION.strip())
+    return "\n\n".join(parts)
+
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -258,6 +288,47 @@ TOOLS: list[dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "type": "function",
+        "name": "refine_ingest_items",
+        "description": (
+            "Refine the active ingest preview using the user's correction. Use only after an ingest "
+            "or deep extraction preview exists in the current session."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "correction": {
+                    "type": "string",
+                    "description": "User instruction describing how to change the active preview",
+                }
+            },
+            "required": ["correction"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "apply_ingest_preview",
+        "description": "Save the active ingest preview to mappings and clear the preview.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "cancel_ingest_preview",
+        "description": "Cancel the active ingest preview without saving anything.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -304,6 +375,7 @@ class AgentCommandService:
         session_active_filename = (
             active_file_meta.filename if (active_file_meta and file_bytes is None) else None
         )
+        active_preview = self._sessions.get_active_ingest_preview(session)
 
         self._sessions.record_user_message(
             session, message, attached_filename=filename if file_bytes else None,
@@ -314,6 +386,8 @@ class AgentCommandService:
             has_file=file_bytes is not None,
             filename=filename,
             session_active_filename=session_active_filename,
+            active_preview_filename=active_preview.filename if active_preview else None,
+            active_preview_count=len(active_preview.items) if active_preview else 0,
             history=history,
         )
         if tool_call is None:
@@ -322,6 +396,8 @@ class AgentCommandService:
                 has_file=file_bytes is not None,
                 filename=filename,
                 session_active_filename=session_active_filename,
+                active_preview_filename=active_preview.filename if active_preview else None,
+                active_preview_count=len(active_preview.items) if active_preview else 0,
                 history=history,
             )
             self._sessions.record_assistant_message(session, reply)
@@ -364,6 +440,8 @@ class AgentCommandService:
         has_file: bool,
         filename: str | None,
         session_active_filename: str | None = None,
+        active_preview_filename: str | None = None,
+        active_preview_count: int = 0,
         history: list[dict[str, str]] | None = None,
     ):
         context_lines = [
@@ -375,6 +453,11 @@ class AgentCommandService:
             context_lines.append(
                 f"Previously attached file in this session: {session_active_filename} "
                 f"(use it for ingest_file or deep_extraction_file if the user refers to it)."
+            )
+        if active_preview_filename:
+            context_lines.append(
+                f"Active ingest preview: yes, file={active_preview_filename}, items={active_preview_count}. "
+                "Use refine_ingest_items/apply_ingest_preview/cancel_ingest_preview for user corrections or confirmation."
             )
         context = "\n".join(context_lines)
 
@@ -407,12 +490,22 @@ class AgentCommandService:
         return parsed
 
     @staticmethod
-    def _unclear_request_message() -> str:
+    def _unclear_request_message(*, include_preview: bool = False) -> str:
         return (
             "Я не до конца понял, какое действие нужно выполнить.\n\n"
-            f"{AGENT_CAPABILITIES}\n"
+            f"{build_agent_capabilities(include_preview=include_preview)}\n"
             "Попробуйте сформулировать запрос еще раз: например, укажите STAL-артикул "
             "и аналоги, которые нужно добавить, удалить или найти."
+        )
+
+    @staticmethod
+    def _attached_file_without_command_message(filename: str | None) -> str:
+        display_name = filename or "файл"
+        return (
+            f"Вижу, что вы прикрепили файл **{display_name}**, но в сообщении нет команды.\n\n"
+            "Напишите, что сделать с файлом: **извлечь связки** или выполнить **глубокий поиск**.\n\n"
+            "Если удобнее — выберите нужное действие в меню кнопок и при необходимости "
+            "отправьте файл снова."
         )
 
     def _natural_conversation_reply(
@@ -421,10 +514,16 @@ class AgentCommandService:
         has_file: bool,
         filename: str | None,
         session_active_filename: str | None = None,
+        active_preview_filename: str | None = None,
+        active_preview_count: int = 0,
         history: list[dict[str, str]] | None = None,
     ) -> str:
         """LLM reply when no tool matches; falls back to template on failure."""
-        fallback = self._unclear_request_message()
+        has_active_preview = bool(active_preview_filename)
+        if has_file and not (user_message or "").strip() and not has_active_preview:
+            return self._attached_file_without_command_message(filename)
+
+        fallback = self._unclear_request_message(include_preview=has_active_preview)
         context_lines = [
             f"User message:\n{user_message or '(пусто)'}",
             f"File attached: {'yes' if has_file else 'no'}",
@@ -434,17 +533,29 @@ class AgentCommandService:
             context_lines.append(
                 f"Previously attached file in this session: {session_active_filename}"
             )
+        if active_preview_filename:
+            context_lines.append(
+                f"Active ingest preview: file={active_preview_filename}, items={active_preview_count}"
+            )
         context_lines.extend([
             "",
             "Facts you may rely on (capabilities):",
-            AGENT_CAPABILITIES.strip(),
+            build_agent_capabilities(include_preview=has_active_preview),
         ])
         if has_file and not (user_message or "").strip():
             context_lines.extend(
                 [
                     "",
                     "Note: user sent a file with almost no text. Explain they can write what to do with the file "
-                    "(extract / deep search) or use the menu buttons.",
+                    "(extract / deep search) or use the menu buttons. Do NOT suggest editing preview.",
+                ]
+            )
+        elif has_file and not has_active_preview:
+            context_lines.extend(
+                [
+                    "",
+                    "Note: no active ingest preview yet. Suggest extract or deep search for the file; "
+                    "do NOT suggest editing preview.",
                 ]
             )
 
@@ -508,7 +619,15 @@ class AgentCommandService:
         if tool_name == "search_article":
             if not result.get("found"):
                 return f"По артикулу {result.get('query')} ничего не найдено."
-            return f"Найден STAL-артикул: {result.get('stal_code')}"
+            query = result.get("query")
+            stal_code = result.get("stal_code")
+            matched_alias = result.get("matched_alias")
+            if matched_alias and matched_alias != query:
+                return (
+                    f"По артикулу {query} найден STAL {stal_code} "
+                    f"(совпадение: {matched_alias})"
+                )
+            return f"По артикулу {query} найден STAL {stal_code}"
 
         if tool_name == "get_mapping":
             if not result.get("found"):
@@ -533,7 +652,9 @@ class AgentCommandService:
                 f"обновлено {result.get('updated', 0)}, всего обработано {result.get('total', 0)}."
             )
 
-        if tool_name == "ingest_file":
+        if tool_name in {"ingest_file", "refine_ingest_items"}:
+            if result.get("status") == "no_active_preview":
+                return "Нет активного предпросмотра для правки. Сначала загрузите файл и выполните извлечение."
             status = result.get("status")
             if status == "no_mappings_found":
                 return (
@@ -542,8 +663,9 @@ class AgentCommandService:
                     "Загрузите, пожалуйста, другой файл — например, таблицу перекрёстных ссылок или прайс "
                     "с колонками STAL и аналогов."
                 )
+            action = "Файл обработан" if tool_name == "ingest_file" else "Предпросмотр обновлён"
             return (
-                f"Файл обработан: извлечено {result.get('items_extracted', 0)}, "
+                f"{action}: извлечено {result.get('items_extracted', 0)}, "
                 "ожидает подтверждения перед сохранением."
             )
 
@@ -555,6 +677,19 @@ class AgentCommandService:
                 f"Глубокий поиск выполнен: найдено {len(items)} STAL-строк к обновлению, "
                 "ожидает подтверждения перед сохранением."
             )
+
+        if tool_name == "apply_ingest_preview":
+            if result.get("status") == "no_active_preview":
+                return "Нет активного предпросмотра для сохранения. Сначала загрузите файл и выполните извлечение."
+            return (
+                f"Данные сохранены: создано {result.get('created', 0)}, "
+                f"обновлено {result.get('updated', 0)}, всего обработано {result.get('total', 0)}."
+            )
+
+        if tool_name == "cancel_ingest_preview":
+            if result.get("status") == "no_active_preview":
+                return "Нет активного предпросмотра для отмены."
+            return "Загрузка отменена. Данные не сохранены."
 
         return "Команда выполнена."
 
@@ -606,13 +741,58 @@ class AgentCommandService:
 
         if tool_name == "bulk_upsert":
             items = [
-                BulkUpsertItem(stal_code=item["stal_code"], aliases=item.get("aliases", []))
+                BulkUpsertItem(
+                    stal_code=item["stal_code"],
+                    aliases=item.get("aliases", []),
+                    alias_parent_codes=item.get("alias_parent_codes", {}),
+                )
                 for item in args["items"]
             ]
             result = self._mapping.bulk_upsert(
                 BulkUpsertRequest(source_filename="agent-command", items=items)
             )
             return result.model_dump()
+
+        if tool_name == "refine_ingest_items":
+            if session is None:
+                return {"status": "no_active_preview"}
+            preview = self._sessions.get_active_ingest_preview(session)
+            if preview is None:
+                return {"status": "no_active_preview"}
+            result = self._agent.refine_ingest_items(
+                RefineIngestItemsRequest(
+                    filename=preview.filename,
+                    items=preview.items,
+                    correction=args["correction"],
+                )
+            )
+            return result.model_dump()
+
+        if tool_name == "apply_ingest_preview":
+            if session is None:
+                return {"status": "no_active_preview"}
+            preview = self._sessions.get_active_ingest_preview(session)
+            if preview is None:
+                return {"status": "no_active_preview"}
+            items = [
+                BulkUpsertItem(
+                    stal_code=item["stal_code"],
+                    aliases=item.get("aliases", []),
+                    alias_parent_codes=item.get("alias_parent_codes", {}),
+                )
+                for item in preview.items
+            ]
+            result = self._mapping.bulk_upsert(
+                BulkUpsertRequest(source_filename=preview.filename, items=items)
+            )
+            payload = result.model_dump()
+            payload.update({"status": "applied", "source_filename": preview.filename})
+            return payload
+
+        if tool_name == "cancel_ingest_preview":
+            if session is None or self._sessions.get_active_ingest_preview(session) is None:
+                return {"status": "no_active_preview"}
+            return {"status": "canceled"}
 
         if tool_name == "ingest_file":
             effective_filename, effective_bytes = self._resolve_file_for_tool(
