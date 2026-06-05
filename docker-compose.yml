@@ -23,6 +23,8 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 3
+    networks:
+      - stal-analogs-storage
 
   minio:
     image: minio/minio:latest
@@ -43,6 +45,13 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 5
+    networks:
+      - stal-analogs-storage
+
+networks:
+  stal-analogs-storage:
+    name: stal-analogs-storage
+    driver: bridge
 
 volumes:
   app_logs:

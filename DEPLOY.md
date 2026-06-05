@@ -166,7 +166,41 @@ docker compose exec minio mc ls local
 ssh -L 9001:127.0.0.1:9001 deploy@YOUR_SERVER_IP
 ```
 
-## 5. Опубликовать наружу
+## 5. Подключить другой контейнер на этом же сервере
+
+`docker-compose.yml` создаёт сеть `stal-analogs-storage`. Другие compose-проекты (например, Telegram-бот) могут подключиться к ней без `host.docker.internal` и без `APP_HOST=0.0.0.0`.
+
+В `docker-compose.yml` бота:
+
+```yaml
+services:
+  bot:
+    # ...
+    networks:
+      - stal-analogs-storage
+
+networks:
+  stal-analogs-storage:
+    external: true
+```
+
+URL API для бота:
+
+```text
+http://stal-analogs-storage-api:8000/agent/command
+```
+
+Проверка с сервера после `docker compose up -d` в обоих проектах:
+
+```bash
+docker network inspect stal-analogs-storage --format '{{range .Containers}}{{.Name}} {{end}}'
+# в контейнере бота:
+docker compose exec bot curl -s http://stal-analogs-storage-api:8000/health
+```
+
+`APP_HOST=127.0.0.1` при этом можно оставить: порт на хосте нужен только для `curl`/nginx, а бот ходит напрямую в контейнер по внутренней сети Docker.
+
+## 6. Опубликовать наружу
 
 Рекомендуемый вариант - nginx или другой reverse proxy на сервере, а контейнер оставить на `127.0.0.1:8000`.
 
